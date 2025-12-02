@@ -14,7 +14,8 @@ import { MachineStateDocument, MachineStatus } from "../database/schema";
 
 /**
  * Handles API requests for machine operations.
- * Routes requests and manages workflow of machine interactions.
+ * This class is responsible for routing requests to the appropriate handlers
+ * and managing the overall workflow of machine interactions.
  */
 export class ApiHandler {
     private cache: DataCache<MachineStateDocument>;
@@ -37,7 +38,12 @@ export class ApiHandler {
     private checkToken(token: string): void {
         const valid = this.idp.validateToken(token);
         if (!valid) {
-            throw new Error("Unauthorized");
+            throw new Error(
+                JSON.stringify({
+                    statusCode: HttpResponseCode.UNAUTHORIZED,
+                    message: "Invalid token",
+                })
+            );
         }
     }
 
@@ -50,29 +56,26 @@ export class ApiHandler {
      * @param request The request model containing location and job IDs.
      * @returns A response model with the status code and the reserved machine's state.
      */
-    private handleRequestMachine(
-        request: RequestMachineRequestModel
-    ): MachineResponseModel {
+    private handleRequestMachine(request: RequestMachineRequestModel): MachineResponseModel {
         const machines = this.db.listMachinesAtLocation(request.locationId);
 
-        const available = machines.find(
-            (m) => m.status === MachineStatus.AVAILABLE
-        );
+        const available = machines.find((m) => m.status === MachineStatus.AVAILABLE);
         if (!available) {
             return { statusCode: HttpResponseCode.NOT_FOUND };
         }
 
-        available.status = MachineStatus.AWAITING_DROPOFF;
-        available.currentJobId = request.jobId;
+        const updatedMachine: MachineStateDocument = {
+            ...available,
+            status: MachineStatus.AWAITING_DROPOFF,
+            currentJobId: request.jobId,
+        };
 
-        this.db.updateMachineStatus(
-            available.machineId,
-            MachineStatus.AWAITING_DROPOFF
-        );
-        this.db.updateMachineJobId(available.machineId, request.jobId);
-        this.cache.put(available.machineId, available);
+        this.db.updateMachineStatus(updatedMachine.machineId, MachineStatus.AWAITING_DROPOFF);
+        this.db.updateMachineJobId(updatedMachine.machineId, request.jobId);
+        this.cache.put(updatedMachine.machineId, updatedMachine);
 
-        return { statusCode: HttpResponseCode.OK, machine: available };
+        const machine = this.db.getMachine(updatedMachine.machineId) || updatedMachine;
+        return { statusCode: HttpResponseCode.OK, machine };
     }
 
     /**
@@ -81,9 +84,7 @@ export class ApiHandler {
      * @param request The request model containing the machine ID.
      * @returns A response model with the status code and the machine's state.
      */
-    private handleGetMachine(
-        request: GetMachineRequestModel
-    ): MachineResponseModel {
+    private handleGetMachine(request: GetMachineRequestModel): MachineResponseModel {
         let machine = this.cache.get(request.machineId);
 
         if (!machine) {
@@ -107,28 +108,39 @@ export class ApiHandler {
      * @param request The request model containing the machine ID.
      * @returns A response model with the status code and the updated machine's state.
      */
-    private handleStartMachine(
-        request: StartMachineRequestModel
-    ): MachineResponseModel {
+    private handleStartMachine(request: StartMachineRequestModel): MachineResponseModel {
         const machine = this.db.getMachine(request.machineId);
         if (!machine) {
             return { statusCode: HttpResponseCode.NOT_FOUND };
         }
 
         if (machine.status !== MachineStatus.AWAITING_DROPOFF) {
-            return { statusCode: HttpResponseCode.BAD_REQUEST };
+            return { statusCode: HttpResponseCode.BAD_REQUEST, machine };
         }
 
         try {
             this.smart.startCycle(machine.machineId);
             this.db.updateMachineStatus(machine.machineId, MachineStatus.RUNNING);
-            machine.status = MachineStatus.RUNNING;
-            this.cache.put(machine.machineId, machine);
 
-            return { statusCode: HttpResponseCode.OK, machine };
-        } catch (err) {
+            const updatedMachine =
+                this.db.getMachine(machine.machineId) || {
+                    ...machine,
+                    status: MachineStatus.RUNNING,
+                };
+
+            this.cache.put(machine.machineId, updatedMachine);
+            return { statusCode: HttpResponseCode.OK, machine: updatedMachine };
+        } catch {
             this.db.updateMachineStatus(machine.machineId, MachineStatus.ERROR);
-            return { statusCode: HttpResponseCode.HARDWARE_ERROR };
+
+            const errorMachine =
+                this.db.getMachine(machine.machineId) || {
+                    ...machine,
+                    status: MachineStatus.ERROR,
+                };
+
+            this.cache.put(machine.machineId, errorMachine);
+            return { statusCode: HttpResponseCode.HARDWARE_ERROR, machine: errorMachine };
         }
     }
 
@@ -143,9 +155,7 @@ export class ApiHandler {
             this.checkToken(request.token);
 
             if (request.method === "POST" && request.path === "/machine/request") {
-                return this.handleRequestMachine(
-                    request as RequestMachineRequestModel
-                );
+                return this.handleRequestMachine(request as RequestMachineRequestModel);
             }
 
             const getMatch = request.path.match(/^\/machine\/([a-zA-Z0-9-]+)$/);
@@ -162,11 +172,10 @@ export class ApiHandler {
                 return this.handleStartMachine(startRequest);
             }
 
-            return { statusCode: HttpResponseCode.BAD_REQUEST };
+            return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR };
         } catch (err: any) {
-            const message = err instanceof Error ? err.message : String(err);
-            if (message.includes("Unauthorized")) {
-                return { statusCode: HttpResponseCode.UNAUTHORIZED };
+            if (err instanceof Error && err.message.includes("Invalid token")) {
+                throw err;
             }
             return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR };
         }
