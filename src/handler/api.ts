@@ -2,17 +2,31 @@ import { DataCache } from "../database/cache";
 import { MachineStateTable } from "../database/table";
 import { IdentityProviderClient } from "../external/idp";
 import { SmartMachineClient } from "../external/smart-machine";
-import { GetMachineRequestModel, HttpResponseCode, MachineResponseModel, RequestMachineRequestModel, RequestModel, StartMachineRequestModel } from "./model";
+import {
+    GetMachineRequestModel,
+    HttpResponseCode,
+    MachineResponseModel,
+    RequestMachineRequestModel,
+    RequestModel,
+    StartMachineRequestModel,
+} from "./model";
 import { MachineStateDocument, MachineStatus } from "../database/schema";
+
 /**
  * Handles API requests for machine operations.
- * This class is responsible for routing requests to the appropriate handlers
- * and managing the overall workflow of machine interactions.
+ * Routes requests and manages workflow of machine interactions.
  */
 export class ApiHandler {
     private cache: DataCache<MachineStateDocument>;
+    private db: MachineStateTable;
+    private idp: IdentityProviderClient;
+    private smart: SmartMachineClient;
+
     constructor() {
         this.cache = DataCache.getInstance<MachineStateDocument>();
+        this.db = MachineStateTable.getInstance();
+        this.idp = IdentityProviderClient.getInstance();
+        this.smart = SmartMachineClient.getInstance();
     }
 
     /**
@@ -20,8 +34,11 @@ export class ApiHandler {
      * @param token The token to validate.
      * @throws An error if the token is invalid.
      */
-    private checkToken(token: string) {
-        // Your implementation here
+    private checkToken(token: string): void {
+        const valid = this.idp.validateToken(token);
+        if (!valid) {
+            throw new Error("Unauthorized");
+        }
     }
 
     /**
@@ -33,8 +50,29 @@ export class ApiHandler {
      * @param request The request model containing location and job IDs.
      * @returns A response model with the status code and the reserved machine's state.
      */
-    private handleRequestMachine(request: RequestMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+    private handleRequestMachine(
+        request: RequestMachineRequestModel
+    ): MachineResponseModel {
+        const machines = this.db.listMachinesAtLocation(request.locationId);
+
+        const available = machines.find(
+            (m) => m.status === MachineStatus.AVAILABLE
+        );
+        if (!available) {
+            return { statusCode: HttpResponseCode.NOT_FOUND };
+        }
+
+        available.status = MachineStatus.AWAITING_DROPOFF;
+        available.currentJobId = request.jobId;
+
+        this.db.updateMachineStatus(
+            available.machineId,
+            MachineStatus.AWAITING_DROPOFF
+        );
+        this.db.updateMachineJobId(available.machineId, request.jobId);
+        this.cache.put(available.machineId, available);
+
+        return { statusCode: HttpResponseCode.OK, machine: available };
     }
 
     /**
@@ -43,8 +81,23 @@ export class ApiHandler {
      * @param request The request model containing the machine ID.
      * @returns A response model with the status code and the machine's state.
      */
-    private handleGetMachine(request: GetMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+    private handleGetMachine(
+        request: GetMachineRequestModel
+    ): MachineResponseModel {
+        let machine = this.cache.get(request.machineId);
+
+        if (!machine) {
+            machine = this.db.getMachine(request.machineId);
+            if (machine) {
+                this.cache.put(machine.machineId, machine);
+            }
+        }
+
+        if (!machine) {
+            return { statusCode: HttpResponseCode.NOT_FOUND };
+        }
+
+        return { statusCode: HttpResponseCode.OK, machine };
     }
 
     /**
@@ -54,8 +107,29 @@ export class ApiHandler {
      * @param request The request model containing the machine ID.
      * @returns A response model with the status code and the updated machine's state.
      */
-    private handleStartMachine(request: StartMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+    private handleStartMachine(
+        request: StartMachineRequestModel
+    ): MachineResponseModel {
+        const machine = this.db.getMachine(request.machineId);
+        if (!machine) {
+            return { statusCode: HttpResponseCode.NOT_FOUND };
+        }
+
+        if (machine.status !== MachineStatus.AWAITING_DROPOFF) {
+            return { statusCode: HttpResponseCode.BAD_REQUEST };
+        }
+
+        try {
+            this.smart.startCycle(machine.machineId);
+            this.db.updateMachineStatus(machine.machineId, MachineStatus.RUNNING);
+            machine.status = MachineStatus.RUNNING;
+            this.cache.put(machine.machineId, machine);
+
+            return { statusCode: HttpResponseCode.OK, machine };
+        } catch (err) {
+            this.db.updateMachineStatus(machine.machineId, MachineStatus.ERROR);
+            return { statusCode: HttpResponseCode.HARDWARE_ERROR };
+        }
     }
 
     /**
@@ -64,28 +138,37 @@ export class ApiHandler {
      * @param request The incoming request model.
      * @returns A response model from one of the specific handlers, or an error response.
      */
-    public handle(request: RequestModel) {
-        this.checkToken(request.token);
+    public handle(request: RequestModel): MachineResponseModel {
+        try {
+            this.checkToken(request.token);
 
-        if (request.method === 'POST' && request.path === '/machine/request') {
-            return this.handleRequestMachine(request as RequestMachineRequestModel);
+            if (request.method === "POST" && request.path === "/machine/request") {
+                return this.handleRequestMachine(
+                    request as RequestMachineRequestModel
+                );
+            }
+
+            const getMatch = request.path.match(/^\/machine\/([a-zA-Z0-9-]+)$/);
+            if (request.method === "GET" && getMatch) {
+                const machineId = getMatch[1];
+                const getRequest = { ...request, machineId } as GetMachineRequestModel;
+                return this.handleGetMachine(getRequest);
+            }
+
+            const startMatch = request.path.match(/^\/machine\/([a-zA-Z0-9-]+)\/start$/);
+            if (request.method === "POST" && startMatch) {
+                const machineId = startMatch[1];
+                const startRequest = { ...request, machineId } as StartMachineRequestModel;
+                return this.handleStartMachine(startRequest);
+            }
+
+            return { statusCode: HttpResponseCode.BAD_REQUEST };
+        } catch (err: any) {
+            const message = err instanceof Error ? err.message : String(err);
+            if (message.includes("Unauthorized")) {
+                return { statusCode: HttpResponseCode.UNAUTHORIZED };
+            }
+            return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR };
         }
-
-        const getMachineMatch = request.path.match(/^\/machine\/([a-zA-Z0-9-]+)$/);
-        if (request.method === 'GET' && getMachineMatch) {
-            const machineId = getMachineMatch[1];
-            const getRequest = { ...request, machineId } as GetMachineRequestModel;
-            return this.handleGetMachine(getRequest);
-        }
-
-        const startMachineMatch = request.path.match(/^\/machine\/([a-zA-Z0-9-]+)\/start$/);
-        if (request.method === 'POST' && startMachineMatch) { 
-            const machineId = startMachineMatch[1];
-            const startRequest = { ...request, machineId } as StartMachineRequestModel;
-            return this.handleStartMachine(startRequest);
-        }
-
-        return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR, machine: null };
     }
-    
 }
